@@ -12,5 +12,6 @@ Designed to be deployed with Docker Compose alongside Plane CE.
 
 1. Clone this repo into your plane-selfhost/plane-app directory
 2. Copy and paste the contents of `docker-compose.yml` into your Plane Compose file
-3. Set your environment variables to match your Plane secret key for verification and Discord webhook URL to forward to
-4. Use Plane's `start.sh` script to restart the Plane stack
+3. Edit the build direcory to `./plane-discord-webhook-bridge`
+4. Set your environment variables to match your Plane secret key for verification and Discord webhook URL to forward to
+6. Use Plane's `start.sh` script to restart the Plane stack
