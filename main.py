@@ -58,6 +58,7 @@ def format_discord_message(plane_payload: Dict[str, Any]) -> Dict[str, Any]:
     Returns:
         A dictionary formatted for the Discord webhook API
     """
+    logger.info(f"Formatting Plane payload for Discord: {json.dumps(plane_payload, indent=2)}")
     event = plane_payload.get("event", "unknown_event")
     action = plane_payload.get("action", "unknown_action")
     data = plane_payload.get("data", {})
