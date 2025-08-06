@@ -1,0 +1,10 @@
+services:
+  plane-discord-bridge:
+    build: .
+    container_name: plane-discord-bridge
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      - DISCORD_WEBHOOK_URL=your_discord_webhook_url_here
+      - PLANE_WEBHOOK_SECRET=your_plane_webhook_secret_here
