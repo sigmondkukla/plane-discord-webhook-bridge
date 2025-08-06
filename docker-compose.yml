@@ -1,7 +1,7 @@
 services:
-  plane-discord-bridge:
+  plane-discord-webhook-bridge:
     build: .
-    container_name: plane-discord-bridge
+    container_name: plane-discord-webhook-bridge
     restart: unless-stopped
     ports:
       - "8000:8000"
