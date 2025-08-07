@@ -31,3 +31,11 @@ Designed to be deployed with Docker Compose alongside Plane CE.
 8. Paste the secret key into your `PLANE_WEBHOOK_SECRET` environment variable
 9. Restart the Plane stack again using `setup.sh`. (maybe only this bridge container needs to be restarted, I'm not sure)
 10. Test the service by making changes to your Plane projects!
+
+### Updating
+
+1. Navigate to the `plane-selfhost/plane-app/plane-discord-webhook-bridge` directory
+2. Pull the lastest changes: `git pull`
+3. Navigate to the parent `plane-app` directory
+4. Rebuild the container with `docker compose build --no-cache plane-discord-webhook-bridge`
+5. Restart Plane using `setup.sh`
