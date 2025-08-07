@@ -13,12 +13,14 @@ from fastapi import FastAPI, Request, Header, HTTPException, Response
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
 PLANE_WEBHOOK_SECRET = os.getenv("PLANE_WEBHOOK_SECRET")
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
-PLANE_BASE_URL = os.getenv("PLANE_BASE_URL", "").rstrip('/')
+PLANE_WORKSPACE_URL = os.getenv("PLANE_WORKSPACE_URL", "").rstrip('/') # should include the workspace name
 
 logging.basicConfig(level=LOG_LEVEL)
 logger = logging.getLogger(__name__)
 
-# --- FastAPI Application ---
+# figure out base URL from workspace URL (https://plane.example.com/workspace_name -> https://plane.example.com)
+plane_base_url = PLANE_WORKSPACE_URL.rstrip('/').rsplit('/', 1)[0] if PLANE_WORKSPACE_URL else None
+
 app = FastAPI(
     title="Plane to Discord Webhook Bridge",
     description="API to receive and verify Plane webhooks and forward them to a Discord channel",
@@ -90,12 +92,12 @@ def format_issue_message(plane_payload: Dict[str, Any]) -> Optional[Dict[str, An
     
     # Build URL to the parent project's issue list
     project_uuid = data.get("project")
-    embed_url = f"{PLANE_BASE_URL}/projects/{project_uuid}/issues/" if project_uuid and PLANE_BASE_URL else None
+    embed_url = f"{PLANE_WORKSPACE_URL}/projects/{project_uuid}/issues/" if project_uuid and PLANE_WORKSPACE_URL else None
 
     # Build Author (the user who performed the action)
     author_info = {
         "name": actor.get("display_name", "Unknown User"),
-        "icon_url": f"{PLANE_BASE_URL}{actor.get('avatar_url')}" if actor.get("avatar_url") and PLANE_BASE_URL else ""
+        "icon_url": f"{plane_base_url}{actor.get('avatar_url')}" if actor.get("avatar_url") and plane_base_url else ""
     }
 
     # Build Description (what happened)
@@ -114,7 +116,7 @@ def format_issue_message(plane_payload: Dict[str, Any]) -> Optional[Dict[str, An
     if priority := data.get("priority"):
         fields.append({"name": "Priority", "value": priority.title(), "inline": True})
     if assignees := data.get("assignees"):
-        assignee_names = ", ".join([a.get("display_name", "Unknown") for a in assignees])
+        assignee_names = ", ".join(list(set([a.get("display_name", "Unknown") for a in assignees]))) # for some reason, there are duplicates sometimes
         fields.append({"name": "Assignees", "value": assignee_names or "None", "inline": False})
     if project_uuid:
         fields.append({"name": "Project ID", "value": f"`{project_uuid}`", "inline": False})
@@ -145,7 +147,7 @@ def format_project_message(plane_payload: Dict[str, Any]) -> Optional[Dict[str, 
     embed_title = f"Project {action.title()}: {title_suffix}"
     
     project_uuid = data.get("id")
-    embed_url = f"{PLANE_BASE_URL}/projects/{project_uuid}/" if project_uuid and PLANE_BASE_URL else None
+    embed_url = f"{PLANE_WORKSPACE_URL}/projects/{project_uuid}/" if project_uuid and PLANE_WORKSPACE_URL else None
 
     author_info = {"name": actor.get("display_name", "Unknown User")}
 
@@ -160,12 +162,47 @@ def format_project_message(plane_payload: Dict[str, Any]) -> Optional[Dict[str, 
         }]
     }
 
-def format_unsupported_message(plane_payload: Dict[str, Any]) -> Dict[str, Any]:
-    """Creates a generic message for unsupported event types."""
-    event_type = plane_payload.get("event", "unknown")
+def format_plaintext(message: str) -> Dict[str, str]:
+    """
+    Format a simple message to be sent to Discord
+    
+    Args:
+        message: The message content
+    
+    Returns:
+        Dict[str, str]: The formatted message payload
+    """
     return {
-        "content": f"Received an unhandled webhook event: `{event_type}`"
+        "content": message
     }
+
+def format_unsupported_message(plane_payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Creates a generic message for unsupported event types"""
+    event_type = plane_payload.get("event", "unknown")
+    return format_plaintext(f"Received an unhandled webhook event: `{event_type}`")
+
+
+def forward_discord_webhook(discord_payload: Dict[str, Any]) -> bool:
+    """
+    Forward the formatted Discord payload to the configured Discord webhook URL.
+    
+    Args:
+        discord_payload: The payload to send to Discord
+    
+    Returns:
+        bool: True if successful, False otherwise
+    """
+    if not DISCORD_WEBHOOK_URL:
+        logger.error("Cannot make request to forward to Discord as DISCORD_WEBHOOK_URL is not set")
+        return False
+
+    try:
+        response = requests.post(DISCORD_WEBHOOK_URL, json=discord_payload, timeout=5)
+        response.raise_for_status()
+        return True
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Failed to send webhook to Discord: {e}")
+        return False
 
 
 @app.on_event("startup")
@@ -175,10 +212,11 @@ async def startup_event():
         logger.warning("DISCORD_WEBHOOK_URL environment variable not set")
     elif not PLANE_WEBHOOK_SECRET:
         logger.warning("PLANE_WEBHOOK_SECRET environment variable not set")
-    elif not PLANE_BASE_URL:
-        logger.warning("PLANE_BASE_URL not set")
+    elif not PLANE_WORKSPACE_URL:
+        logger.warning("PLANE_WORKSPACE_URL not set")
     else:
         logger.info("All required environment variables are set")
+        forward_discord_webhook(format_plaintext("Plane to Discord webhook bridge started successfully!"))
 
 
 @app.get("/", summary="Health Check", description="Verify that the service is running")
@@ -218,6 +256,9 @@ async def plane_webhook_handler(
     except json.JSONDecodeError:
         logger.error("Failed to decode JSON payload")
         raise HTTPException(status_code=400, detail="Invalid JSON payload")
+    
+    # debug the received webhook contents
+    logger.debug(f"Received webhook contents:\n{json.dumps(plane_payload, indent=2)}")
 
     event_type = plane_payload.get("event")
     formatter = {
@@ -227,23 +268,17 @@ async def plane_webhook_handler(
     
     discord_payload = formatter(plane_payload)
 
+    logger.debug(f"Formatted Discord payload:\n{json.dumps(discord_payload, indent=2)}")
+
     if not discord_payload:
-        return Response(content="Webhook received but could not be processed.", status_code=200)
+        return Response(content="Webhook received but could not be processed", status_code=200)
 
     # forward the message to Discord
-    if not DISCORD_WEBHOOK_URL:
-        logger.error("Cannot send to Discord because DISCORD_WEBHOOK_URL is not set")
-        # Return 200 to Plane so it doesn't retry, but log the error, maybe not a good idea idk
-        return Response(content="Webhook received but not forwarded due to missing DISCORD_WEBHOOK_URL", status_code=200)
-
-    try:
-        response = requests.post(DISCORD_WEBHOOK_URL, json=discord_payload, timeout=5)
-        response.raise_for_status()  # Raise an exception for bad status codes (4xx or 5xx)
+    ret = forward_discord_webhook(discord_payload)
+    if ret:
         logger.info(f"Successfully forwarded webhook event '{x_plane_event}' to Discord")
-    except requests.exceptions.RequestException as e:
-        logger.error(f"Failed to send webhook to Discord: {e}")
-        # We don't raise an HTTPException here because Plane would retry
-        # It's better to acknowledge the webhook and log the forwarding error
-        return Response(content="Webhook received but failed to forward to Discord", status_code=502)
-
+    else:
+        logger.error(f"Failed to forward webhook event '{x_plane_event}' to Discord")
+        return Response(content="Webhook received but failed to forward to Discord", status_code=200)
+    
     return {"status": "success", "detail": "Webhook forwarded to Discord"}

@@ -21,7 +21,7 @@ Designed to be deployed with Docker Compose alongside Plane CE.
     environment:
       - DISCORD_WEBHOOK_URL=paste_here
       - PLANE_WEBHOOK_SECRET=paste_here
-      - PLANE_BASE_URL=https://plane.example.com/workspace_name
+      - PLANE_WORKSPACE_URL=https://plane.example.com/workspace_name
 ```
 3. Set your `DISCORD_WEBHOOK_URL` environment variable to the webhook URL from Discord
 4. Leave `PLANE_WEBHOOK_SECRET` blank for now
