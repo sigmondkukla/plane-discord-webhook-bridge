@@ -10,3 +10,4 @@ services:
       - PLANE_WEBHOOK_SECRET=your_plane_webhook_secret_here
       - LOG_LEVEL=INFO
       - PLANE_WORKSPACE_URL=https://plane.example.com/workspace_name
+      - PERSONAL_ACCESS_TOKEN=your_personal_access_token_here
