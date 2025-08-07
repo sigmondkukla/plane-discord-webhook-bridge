@@ -34,7 +34,7 @@ class PlaneAPIClient:
             logger.warning("Plane API client not initialized due to missing URL or TOKEN.")
         else:
             self._session = requests.Session()
-            self._session.headers.update({"Authorization": f"Bearer {token}"})
+            self._session.headers.update({"X-API-Key": token})
             self.api_base_url = api_base_url
 
     @lru_cache(maxsize=128)
