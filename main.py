@@ -5,6 +5,7 @@ import hashlib
 import json
 import logging
 import re
+from functools import lru_cache
 from typing import Dict, Any, Optional, List
 
 import requests
@@ -15,12 +16,51 @@ DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
 PLANE_WEBHOOK_SECRET = os.getenv("PLANE_WEBHOOK_SECRET")
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 PLANE_WORKSPACE_URL = os.getenv("PLANE_WORKSPACE_URL", "").rstrip('/') # This should be the full URL to the workspace such as https://plane.example.com/example
+PERSONAL_ACCESS_TOKEN = os.getenv("PERSONAL_ACCESS_TOKEN")
 
 logging.basicConfig(level=LOG_LEVEL)
 logger = logging.getLogger(__name__)
 
 # Figure out base URL from workspace URL (converts https://plane.example.com/example-workspace -> https://plane.example.com)
 plane_base_url = PLANE_WORKSPACE_URL.rsplit('/', 1)[0] if PLANE_WORKSPACE_URL else None
+# Construct the base API URL from the workspace URL (includes the workspace ID)
+plane_api_base_url = f"{plane_base_url}/api/v1/workspaces/{PLANE_WORKSPACE_URL.split('/')[-1]}" if plane_base_url else None
+
+class PlaneAPIClient:
+    """Client to interact with the Plane API"""
+    def __init__(self, api_base_url: Optional[str], token: Optional[str]):
+        if not api_base_url or not token:
+            self._session = None
+            logger.warning("Plane API client not initialized due to missing URL or TOKEN.")
+        else:
+            self._session = requests.Session()
+            self._session.headers.update({"Authorization": f"Bearer {token}"})
+            self.api_base_url = api_base_url
+
+    @lru_cache(maxsize=128)
+    def _make_request(self, endpoint: str) -> Optional[Dict[str, Any]]:
+        """Internal method to make and cache API requests"""
+        if not self._session:
+            return None
+        try:
+            url = f"{self.api_base_url}{endpoint}"
+            logger.debug(f"Making API request to: {url}")
+            response = self._session.get(url)
+            response.raise_for_status()
+            return response.json()
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Failed to make API request to {endpoint}: {e}")
+            return None
+
+    def get_project_details(self, project_id: str) -> Optional[Dict[str, Any]]:
+        """Fetches details for a specific project"""
+        return self._make_request(f"/projects/{project_id}/")
+
+    def get_issue_details(self, project_id: str, issue_id: str) -> Optional[Dict[str, Any]]:
+        """Fetches details for a specific issue"""
+        return self._make_request(f"/projects/{project_id}/issues/{issue_id}/")
+
+plane_api = PlaneAPIClient(plane_api_base_url, PERSONAL_ACCESS_TOKEN)
 
 app = FastAPI(
     title="Plane to Discord Webhook Bridge",
@@ -28,6 +68,7 @@ app = FastAPI(
     version="1.0.0"
 )
 
+# --- Helper Functions ---
 def verify_signature(payload_body: bytes, secret_token: str, signature_header: str) -> bool:
     """Verify the incoming webhook signature from Plane"""
     if not secret_token:
@@ -76,70 +117,78 @@ def format_update_description(activity: Dict[str, Any]) -> str:
         return f"**{field.replace('_', ' ').title()}** changed from `{old_value}` to `{new_value}`."
     return "Issue details updated"
 
-def format_assignees(assignee_list: List[Dict[str, Any]]) -> str:
-    """Formats a list of assignees for a work item"""
-    if not assignee_list:
+def format_assignees(webhook_assignees: List[Dict[str, Any]], api_assignee_ids: List[str]) -> str:
+    """Formats a list of assignees, filtering against the live API data to ensure accuracy"""
+    if not webhook_assignees or not api_assignee_ids:
         return "None"
-    unique_assignees = {p['id']: p for p in assignee_list}.values() # Use a dict to deduplicate by ID
-    return ", ".join([get_full_name(p) for p in unique_assignees])
+    
+    # Filter assignees from webhook payload to only include those present in the API response
+    live_assignees = {p['id']: p for p in webhook_assignees if p['id'] in api_assignee_ids}
+    return ", ".join([get_full_name(p) for p in live_assignees.values()]) or "None"
 
-def format_issue_message(plane_payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """Formats an issue event into an embed message"""
+def format_issue_message(plane_payload: Dict[str, Any], api_client: PlaneAPIClient) -> Optional[Dict[str, Any]]:
+    """Formats an 'issue' event into an embed message using live API data"""
     action = plane_payload.get("action", "created")
     data = plane_payload.get("data", {})
-    activity = plane_payload.get("activity", {})
-    actor = activity.get("actor", {})
+    actor = plane_payload.get("activity", {}).get("actor", {})
 
-    # issue_seq_id = data.get("sequence_id") # this isn't too useful until we can figure out the slug for each project name...
-    issue_name = data.get("name", "Untitled Issue")
-    embed_title = f"Issue created: {issue_name}"
+    project_id, issue_id = data.get("project"), data.get("id")
+    if not project_id or not issue_id: return None
+
+    project_details = api_client.get_project_details(project_id)
+    issue_details = api_client.get_issue_details(project_id, issue_id)
+    if not project_details or not issue_details:
+        logger.warning(f"Could not fetch API details for issue {issue_id} in project {project_id}. Skipping notification.")
+        return None
+
+    project_identifier = project_details.get("identifier", "PROJ")
+    project_emoji = project_details.get("emoji") or ""
+    issue_seq_id = issue_details.get("sequence_id")
     
-    project_uuid = data.get("project")
-    issue_uuid = data.get("id")
-    embed_url = f"{PLANE_WORKSPACE_URL}/projects/{project_uuid}/issues/{issue_uuid}" if all([project_uuid, issue_uuid, PLANE_WORKSPACE_URL]) else None
+    embed_title = f"{project_emoji} Work item {action}: {project_identifier}-{issue_seq_id}"
+    embed_url = f"{PLANE_WORKSPACE_URL}/projects/{project_id}/issues/{issue_id}"
+    
+    description_html = issue_details.get("description_html", "")
+    description_text = f"**[{issue_details.get('name', 'Untitled Issue')}]({embed_url})**"
+    stripped_description = strip_html(description_html)
+    if stripped_description:
+        description_text += f"\n\n{stripped_description}"
 
     if action == "updated":
-        embed_description = format_update_description(activity)
-    elif action == "deleted":
-        embed_description = f"Issue was deleted by **{get_full_name(actor)}**."
-        embed_title = f"Issue Deleted: {issue_name}"
-    else: # must have been created
-        embed_description = "A new issue was created."
+        description_text = f"{format_update_description(plane_payload.get('activity', {}))}\n\n{description_text}"
 
-    fields = []
-    if state_name := data.get("state", {}).get("name"):
-        fields.append({"name": "State", "value": state_name, "inline": True})
-    if priority := data.get("priority"):
-        fields.append({"name": "Priority", "value": priority.title(), "inline": True})
-    if assignees := data.get("assignees"):
-        fields.append({"name": "Assignees", "value": format_assignees(assignees), "inline": False})
-    
+    fields = [
+        {"name": "Status", "value": data.get("state", {}).get("name", "N/A"), "inline": True},
+        {"name": "Priority", "value": data.get("priority", "none").title(), "inline": True},
+        {"name": "Assignees", "value": format_assignees(data.get("assignees", []), issue_details.get("assignees", [])), "inline": False}
+    ]
+
     return {
         "embeds": [{
             "author": get_author_info(actor),
             "title": embed_title,
             "url": embed_url,
-            "description": embed_description,
+            "description": description_text,
             "color": hex_to_int(data.get("state", {}).get("color")),
             "fields": fields,
             "timestamp": data.get("updated_at") or data.get("created_at")
         }]
     }
 
-def format_project_message(plane_payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+def format_project_message(plane_payload: Dict[str, Any], api_client: PlaneAPIClient) -> Optional[Dict[str, Any]]:
     """Formats a project event into an embed message"""
     action = plane_payload.get("action", "created")
     data = plane_payload.get("data", {})
-    activity = plane_payload.get("activity", {})
-    actor = activity.get("actor", {})
+    actor = plane_payload.get("activity", {}).get("actor", {})
 
+    project_emoji = data.get("emoji") or ""
     project_name = data.get("name", "Untitled Project")
     project_identifier = data.get("identifier")
     title_suffix = f"{project_name} [{project_identifier}]" if project_identifier else project_name
-    embed_title = f"Project {action.title()}: {title_suffix}"
+    embed_title = f"{project_emoji} Project {action.title()}: {title_suffix}"
     
-    project_uuid = data.get("id")
-    embed_url = f"{PLANE_WORKSPACE_URL}/projects/{project_uuid}/" if project_uuid and PLANE_WORKSPACE_URL else None
+    project_id = data.get("id")
+    embed_url = f"{PLANE_WORKSPACE_URL}/projects/{project_id}/" if project_id and PLANE_WORKSPACE_URL else None
 
     return {
         "embeds": [{
@@ -152,25 +201,30 @@ def format_project_message(plane_payload: Dict[str, Any]) -> Optional[Dict[str, 
         }]
     }
 
-def format_issue_comment_message(plane_payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+def format_issue_comment_message(plane_payload: Dict[str, Any], api_client: PlaneAPIClient) -> Optional[Dict[str, Any]]:
     """Formats an issue_comment event into an embed message"""
-    action = plane_payload.get("action", "created")
     data = plane_payload.get("data", {})
-    activity = plane_payload.get("activity", {})
-    actor = activity.get("actor", {})
+    actor = plane_payload.get("activity", {}).get("actor", {})
 
-    project_uuid = data.get("project")
-    issue_uuid = data.get("issue")
-    embed_title = "New Comment on an Issue"
-    embed_url = f"{PLANE_WORKSPACE_URL}/projects/{project_uuid}/issues/{issue_uuid}" if all([project_uuid, issue_uuid, PLANE_WORKSPACE_URL]) else None
+    project_id, issue_id = data.get("project"), data.get("issue")
+    if not project_id or not issue_id: return None
+    
+    project_details = api_client.get_project_details(project_id)
+    issue_details = api_client.get_issue_details(project_id, issue_id)
+    if not project_details or not issue_details:
+        logger.warning(f"Could not fetch API details for comment on issue {issue_id}. Skipping notification.")
+        return None
 
+    project_identifier = project_details.get("identifier", "PROJ")
+    project_emoji = project_details.get("emoji") or "📄"
+    issue_seq_id = issue_details.get("sequence_id")
+    issue_name = issue_details.get("name", "Untitled Issue")
+
+    embed_title = f"New comment on: {project_emoji} {project_identifier}-{issue_seq_id} {issue_name}"
+    embed_url = f"{PLANE_WORKSPACE_URL}/projects/{project_id}/issues/{issue_id}"
+    
     comment_text = strip_html(data.get("comment_html", ""))
-    if action == "deleted":
-        embed_description = "A comment was deleted."
-    elif action == "updated":
-        embed_description = f"Comment updated:\n>>> {comment_text}"
-    else: # created
-        embed_description = f">>> {comment_text}"
+    embed_description = f">>> {comment_text}"
 
     return {
         "embeds": [{
@@ -179,7 +233,7 @@ def format_issue_comment_message(plane_payload: Dict[str, Any]) -> Optional[Dict
             "url": embed_url,
             "description": embed_description,
             "color": 8359053,  # Neutral Grey
-            "timestamp": data.get("updated_at") or data.get("created_at")
+            "timestamp": data.get("created_at")
         }]
     }
 
@@ -187,7 +241,7 @@ def format_plaintext(message: str) -> Dict[str, str]:
     """Formats a plaintext message to be sent to Discord"""
     return {"content": message}
 
-def format_unsupported_message(plane_payload: Dict[str, Any]) -> Dict[str, Any]:
+def format_unsupported_message(plane_payload: Dict[str, Any], api_client: PlaneAPIClient) -> Dict[str, Any]:
     """Creates a generic message for unsupported event types"""
     event_type = plane_payload.get("event", "unknown")
     return format_plaintext(f"Received an unhandled webhook event: `{event_type}`")
@@ -198,7 +252,7 @@ def forward_to_discord(discord_payload: Dict[str, Any]) -> bool:
         logger.error("Cannot forward to Discord because DISCORD_WEBHOOK_URL is not set")
         return False
     try:
-        response = requests.post(DISCORD_WEBHOOK_URL, json=discord_payload, timeout=5)
+        response = requests.post(DISCORD_WEBHOOK_URL, json=discord_payload, timeout=10)
         response.raise_for_status()
         return True
     except requests.exceptions.RequestException as e:
@@ -208,8 +262,8 @@ def forward_to_discord(discord_payload: Dict[str, Any]) -> bool:
 @app.on_event("startup")
 async def startup_event():
     """Checks for environment variables and sends a startup message"""
-    if not all([DISCORD_WEBHOOK_URL, PLANE_WEBHOOK_SECRET, PLANE_WORKSPACE_URL]):
-        logger.warning("At least one required environment variable is missing")
+    if not all([DISCORD_WEBHOOK_URL, PLANE_WEBHOOK_SECRET, PLANE_WORKSPACE_URL, PERSONAL_ACCESS_TOKEN]):
+        logger.warning("One or more required environment variables are missing. API features may be disabled.")
     else:
         logger.info("All required environment variables are set.")
         forward_to_discord(format_plaintext("plane-discord-webhook-bridge started successfully!"))
@@ -239,9 +293,9 @@ async def plane_webhook_handler(request: Request, x_plane_signature: str = Heade
         "issue_comment": format_issue_comment_message,
     }.get(plane_payload.get("event"), format_unsupported_message)
     
-    discord_payload = formatter(plane_payload)
+    discord_payload = formatter(plane_payload, plane_api)
     if not discord_payload:
-        return Response(content="Webhook received but could not be processed", status_code=200)
+        return Response(content="Webhook received but could not be processed (potentially failed API lookup)", status_code=200)
 
     logger.debug(f"Formatted Discord payload:\n{json.dumps(discord_payload, indent=2)}")
     
@@ -249,5 +303,5 @@ async def plane_webhook_handler(request: Request, x_plane_signature: str = Heade
         logger.info(f"Successfully forwarded webhook event '{x_plane_event}' to Discord")
         return {"status": "success", "detail": "Webhook forwarded to Discord"}
     else:
-        logger.error(f"Failed to forward webhook event '{x_plane_event}' to Discord")
+        # The forward_to_discord function already logs the specific error
         return Response(content="Webhook received but failed to forward to Discord", status_code=502)
