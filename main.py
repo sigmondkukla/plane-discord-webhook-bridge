@@ -4,7 +4,7 @@ import hmac
 import hashlib
 import json
 import logging
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 
 import requests
 from fastapi import FastAPI, Request, Header, HTTPException, Response
@@ -13,6 +13,7 @@ from fastapi import FastAPI, Request, Header, HTTPException, Response
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
 PLANE_WEBHOOK_SECRET = os.getenv("PLANE_WEBHOOK_SECRET")
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+PLANE_BASE_URL = os.getenv("PLANE_BASE_URL", "").rstrip('/')
 
 logging.basicConfig(level=LOG_LEVEL)
 logger = logging.getLogger(__name__)
@@ -48,73 +49,136 @@ def verify_signature(payload_body: bytes, secret_token: str, signature_header: s
     expected_signature = hash_object.hexdigest()
     return hmac.compare_digest(expected_signature, signature_header)
 
-def format_discord_message(plane_payload: Dict[str, Any]) -> Dict[str, Any]:
+def hex_to_int(hex_string: str) -> int:
     """
-    Formats the Plane webhook data into a Discord embed message
-
+    Convert a hex color string (formatted #RRGGBB) to an integer for Discord embeds
+    
     Args:
-        plane_payload: The parsed JSON payload from Plane
-
-    Returns:
-        A dictionary formatted for the Discord webhook API
-    """
-    logger.info(f"Formatting Plane payload for Discord: {json.dumps(plane_payload, indent=2)}")
-    event = plane_payload.get("event", "unknown_event")
-    action = plane_payload.get("action", "unknown_action")
-    data = plane_payload.get("data", {})
-    workspace_detail = data.get("workspace_detail", {})
-    
-    # embed color chosen based on action
-    color_map = {
-        "create": 3066993, # green
-        "update": 3447003, # blue
-        "delete": 15158332 # red
-    }
-    embed_color = color_map.get(action, 8359053) # grey for other actions
-
-    title = f"{event.replace('_', ' ').title()} {action.title()}"
-    
-    description = ""
-    if data.get("name"):
-        description = f"**Name:** {data.get('name')}"
-    elif data.get("id"):
-         description = f"**ID:** `{data.get('id')}`"
-
-    # embed fields for additional data
-    fields = []
-    if data.get("identifier"):
-        fields.append({"name": "Identifier", "value": data["identifier"], "inline": True})
-    if data.get("state_detail", {}).get("name"):
-        fields.append({"name": "State", "value": data["state_detail"]["name"], "inline": True})
-    if data.get("project_detail", {}).get("name"):
-        fields.append({"name": "Project", "value": data["project_detail"]["name"], "inline": True})
+        hex_string: The hex color string
         
-    # build the payload for the discord post request
-    discord_payload = {
-        "embeds": [
-            {
-                "title": title,
-                "description": description,
-                "color": embed_color,
-                "fields": fields,
-                "footer": {
-                    "text": f"Workspace: {workspace_detail.get('name', 'N/A')}"
-                },
-                "timestamp": plane_payload.get("created_at")
-            }
-        ]
+    Returns:
+        int: The integer representation of the color
+    """
+    if not hex_string:
+        return 0
+    return int(hex_string.lstrip('#'), 16)
+
+def format_update_description(activity: Dict[str, Any]) -> str:
+    """Creates a human-readable string for an 'updated' action from Plane, detailing what changed"""
+    field = activity.get("field")
+    old_value = activity.get("old_value") or "None"
+    new_value = activity.get("new_value") or "None"
+
+    if isinstance(old_value, list): old_value = f"[{len(old_value)} items]"
+    if isinstance(new_value, list): new_value = f"[{len(new_value)} items]"
+
+    if field:
+        return f"**{field.replace('_', ' ').title()}** changed from `{old_value}` to `{new_value}`."
+    return "Issue details were updated."
+
+def format_issue_message(plane_payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Formats an 'issue' event into a rich Discord embed message."""
+    action = plane_payload.get("action", "created")
+    data = plane_payload.get("data", {})
+    activity = plane_payload.get("activity", {})
+    actor = activity.get("actor", {})
+
+    # Build Title
+    issue_seq_id = data.get("sequence_id")
+    issue_name = data.get("name", "Untitled Issue")
+    embed_title = f"Issue #{issue_seq_id}: {issue_name}"
+    
+    # Build URL to the parent project's issue list
+    project_uuid = data.get("project")
+    embed_url = f"{PLANE_BASE_URL}/projects/{project_uuid}/issues/" if project_uuid and PLANE_BASE_URL else None
+
+    # Build Author (the user who performed the action)
+    author_info = {
+        "name": actor.get("display_name", "Unknown User"),
+        "icon_url": f"{PLANE_BASE_URL}{actor.get('avatar_url')}" if actor.get("avatar_url") and PLANE_BASE_URL else ""
     }
-    return discord_payload
+
+    # Build Description (what happened)
+    if action == "updated":
+        embed_description = format_update_description(activity)
+    elif action == "deleted":
+        embed_description = f"Issue was deleted by **{actor.get('display_name', 'Unknown User')}**."
+        embed_title = f"Issue Deleted: #{issue_seq_id} {issue_name}"
+    else: # created
+        embed_description = f"A new issue was created."
+
+    # Build Fields for additional details
+    fields = []
+    if state_name := data.get("state", {}).get("name"):
+        fields.append({"name": "State", "value": state_name, "inline": True})
+    if priority := data.get("priority"):
+        fields.append({"name": "Priority", "value": priority.title(), "inline": True})
+    if assignees := data.get("assignees"):
+        assignee_names = ", ".join([a.get("display_name", "Unknown") for a in assignees])
+        fields.append({"name": "Assignees", "value": assignee_names or "None", "inline": False})
+    if project_uuid:
+        fields.append({"name": "Project ID", "value": f"`{project_uuid}`", "inline": False})
+    
+    return {
+        "embeds": [{
+            "author": author_info,
+            "title": embed_title,
+            "url": embed_url,
+            "description": embed_description,
+            "color": hex_to_int(data.get("state", {}).get("color")),
+            "fields": fields,
+            "timestamp": data.get("updated_at") or data.get("created_at")
+        }]
+    }
+
+def format_project_message(plane_payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Formats a 'project' event into a rich Discord embed message."""
+    action = plane_payload.get("action", "created")
+    data = plane_payload.get("data", {})
+    activity = plane_payload.get("activity", {})
+    actor = activity.get("actor", {})
+
+    project_name = data.get("name", "Untitled Project")
+    project_identifier = data.get("identifier")
+    
+    title_suffix = f"{project_name} [{project_identifier}]" if project_identifier else project_name
+    embed_title = f"Project {action.title()}: {title_suffix}"
+    
+    project_uuid = data.get("id")
+    embed_url = f"{PLANE_BASE_URL}/projects/{project_uuid}/" if project_uuid and PLANE_BASE_URL else None
+
+    author_info = {"name": actor.get("display_name", "Unknown User")}
+
+    return {
+        "embeds": [{
+            "author": author_info,
+            "title": embed_title,
+            "url": embed_url,
+            "description": f"The project **{project_name}** was {action}.",
+            "color": 3447003,  # Blue
+            "timestamp": data.get("updated_at") or data.get("created_at")
+        }]
+    }
+
+def format_unsupported_message(plane_payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Creates a generic message for unsupported event types."""
+    event_type = plane_payload.get("event", "unknown")
+    return {
+        "content": f"Received an unhandled webhook event: `{event_type}`"
+    }
+
 
 @app.on_event("startup")
 async def startup_event():
-    """
-    (debug) check for environment variables
-    """
+    """Check for necessary environment variables on startup."""
     if not DISCORD_WEBHOOK_URL:
         logger.warning("DISCORD_WEBHOOK_URL environment variable not set")
-    if not PLANE_WEBHOOK_SECRET:
+    elif not PLANE_WEBHOOK_SECRET:
         logger.warning("PLANE_WEBHOOK_SECRET environment variable not set")
+    elif not PLANE_BASE_URL:
+        logger.warning("PLANE_BASE_URL not set")
+    else:
+        logger.info("All required environment variables are set")
 
 
 @app.get("/", summary="Health Check", description="Verify that the service is running")
@@ -155,10 +219,16 @@ async def plane_webhook_handler(
         logger.error("Failed to decode JSON payload")
         raise HTTPException(status_code=400, detail="Invalid JSON payload")
 
-    # create embed message for Discord
-    discord_payload = format_discord_message(plane_payload)
-    logger.info(f"Formatted Discord message: {json.dumps(discord_payload, indent=2)}")
+    event_type = plane_payload.get("event")
+    formatter = {
+        "issue": format_issue_message,
+        "project": format_project_message,
+    }.get(event_type, format_unsupported_message)
+    
+    discord_payload = formatter(plane_payload)
 
+    if not discord_payload:
+        return Response(content="Webhook received but could not be processed.", status_code=200)
 
     # forward the message to Discord
     if not DISCORD_WEBHOOK_URL:
