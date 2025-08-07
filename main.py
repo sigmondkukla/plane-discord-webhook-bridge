@@ -4,6 +4,7 @@ import hmac
 import hashlib
 import json
 import logging
+import re
 from typing import Dict, Any, Optional
 
 import requests
@@ -64,6 +65,12 @@ def hex_to_int(hex_string: str) -> int:
     if not hex_string:
         return 0
     return int(hex_string.lstrip('#'), 16)
+
+def strip_html(html_string: str) -> str:
+    """Removes HTML tags from a string."""
+    if not html_string:
+        return ""
+    return re.sub('<[^<]+?>', '', html_string)
 
 def format_update_description(activity: Dict[str, Any]) -> str:
     """Creates a human-readable string for an 'updated' action from Plane, detailing what changed"""
@@ -176,6 +183,54 @@ def format_plaintext(message: str) -> Dict[str, str]:
         "content": message
     }
 
+
+def format_issue_comment_message(plane_payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Formats an 'issue_comment' event into a rich Discord embed message."""
+    action = plane_payload.get("action", "created")
+    data = plane_payload.get("data", {})
+    activity = plane_payload.get("activity", {})
+    actor = activity.get("actor", {})
+
+    # The payload doesn't contain the issue title, so we create a generic one.
+    embed_title = f"New Comment on an Issue"
+
+    project_uuid = data.get("project")
+    issue_uuid = data.get("issue")
+    # Link to the project's issue list, as we don't have the issue's sequence ID for a direct link.
+    embed_url = f"{PLANE_WORKSPACE_URL}/projects/{project_uuid}/issues/" if project_uuid and PLANE_WORKSPACE_URL else None
+
+    author_info = {
+        "name": actor.get("display_name", "Unknown User"),
+        "icon_url": f"{plane_base_url}{actor.get('avatar_url')}" if actor.get("avatar_url") and plane_base_url else ""
+    }
+
+    comment_text = strip_html(data.get("comment_html", ""))
+    if action == "deleted":
+        embed_description = "A comment was deleted."
+    elif action == "updated":
+        embed_description = f"Comment updated:\n>>> {comment_text}"
+    else: # created
+        embed_description = f">>> {comment_text}"
+
+    fields = []
+    if issue_uuid:
+        fields.append({"name": "Issue ID", "value": f"`{issue_uuid}`", "inline": True})
+    if project_uuid:
+        fields.append({"name": "Project ID", "value": f"`{project_uuid}`", "inline": True})
+
+    return {
+        "embeds": [{
+            "author": author_info,
+            "title": embed_title,
+            "url": embed_url,
+            "description": embed_description,
+            "color": 8359053,  # Neutral Grey
+            "fields": fields,
+            "timestamp": data.get("updated_at") or data.get("created_at")
+        }]
+    }
+
+
 def format_unsupported_message(plane_payload: Dict[str, Any]) -> Dict[str, Any]:
     """Creates a generic message for unsupported event types"""
     event_type = plane_payload.get("event", "unknown")
@@ -222,7 +277,7 @@ async def startup_event():
 @app.get("/", summary="Health Check", description="Verify that the service is running")
 async def health_check():
     """
-    Health check endpoint to confirm the service is running, useful for monitoring.
+    Health check endpoint to confirm the service is running, useful for monitoring
     Could be expanded later.
     """
     return {"status": "ok", "message": "Plane to Discord webhook bridge is running"}
@@ -264,6 +319,7 @@ async def plane_webhook_handler(
     formatter = {
         "issue": format_issue_message,
         "project": format_project_message,
+        "issue_comment": format_issue_comment_message,
     }.get(event_type, format_unsupported_message)
     
     discord_payload = formatter(plane_payload)
