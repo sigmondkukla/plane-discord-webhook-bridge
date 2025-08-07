@@ -9,4 +9,4 @@ services:
       - DISCORD_WEBHOOK_URL=your_discord_webhook_url_here
       - PLANE_WEBHOOK_SECRET=your_plane_webhook_secret_here
       - LOG_LEVEL=INFO
-      - PLANE_BASE_URL=https://plane.example.com
+      - PLANE_BASE_URL=https://plane.example.com/workspace_name
