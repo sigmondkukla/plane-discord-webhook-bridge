@@ -159,18 +159,19 @@ def format_issue_message(plane_payload: Dict[str, Any], api_client: PlaneAPIClie
     project_identifier = project_details.get("identifier", "PROJ")
     project_emoji = get_project_emoji(project_details.get("logo_props", {}))
     issue_seq_id = issue_details.get("sequence_id")
-    
-    embed_title = f"{project_emoji} Work item {action}: {project_identifier}-{issue_seq_id}"
+
+    issue_name = issue_details.get("name", "?")
+
+    embed_title = f"{project_emoji} {project_identifier}-{issue_seq_id} {action}: {issue_name}"
     embed_url = f"{PLANE_WORKSPACE_URL}/projects/{project_id}/issues/{issue_id}"
     
-    description_html = issue_details.get("description_html", "")
-    description_text = f"**[{issue_details.get('name', 'Untitled Issue')}]({embed_url})**"
-    stripped_description = strip_html(description_html)
-    if stripped_description:
-        description_text += f"\n\n{stripped_description}"
-
-    if action == "updated":
-        description_text = f"{format_update_description(plane_payload.get('activity', {}))}\n\n{description_text}"
+    match action:
+        case "created":
+            description_text = strip_html(issue_details.get("description_html", ""))
+        case "updated":
+            description_text = f"{format_update_description(plane_payload.get('activity', {}))}\n\n{description_text}"
+        case _:
+            description_text = ""
 
     fields = [
         {"name": "Status", "value": data.get("state", {}).get("name", "N/A"), "inline": True},
