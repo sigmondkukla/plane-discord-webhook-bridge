@@ -104,6 +104,21 @@ def get_author_info(actor: Dict[str, Any]) -> Dict[str, str]:
         "icon_url": icon_url
     }
 
+# "logo_props": {
+#     "emoji": {
+#       "url": "https://cdn.jsdelivr.net/npm/emoji-datasource-apple/img/apple/64/1f3db-fe0f.png",
+#       "value": "127963-65039"
+#     },
+#     "in_use": "emoji"
+#   },
+def get_project_emoji(logo_props: Dict[str, Any]) -> str:
+    """Extracts the project emoji from the logo properties"""
+    emoji = logo_props.get("emoji", {}).get("value", "")
+    if emoji:
+        code = emoji.split('-')
+        return chr(int(code[0]))
+    return "?"
+
 def format_update_description(activity: Dict[str, Any]) -> str:
     """Creates a human-readable string for an updated action from Plane"""
     field = activity.get("field")
@@ -142,7 +157,7 @@ def format_issue_message(plane_payload: Dict[str, Any], api_client: PlaneAPIClie
         return None
 
     project_identifier = project_details.get("identifier", "PROJ")
-    project_emoji = project_details.get("emoji") or ""
+    project_emoji = get_project_emoji(project_details.get("logo_props", {}))
     issue_seq_id = issue_details.get("sequence_id")
     
     embed_title = f"{project_emoji} Work item {action}: {project_identifier}-{issue_seq_id}"
@@ -181,7 +196,7 @@ def format_project_message(plane_payload: Dict[str, Any], api_client: PlaneAPICl
     data = plane_payload.get("data", {})
     actor = plane_payload.get("activity", {}).get("actor", {})
 
-    project_emoji = data.get("emoji") or ""
+    project_emoji = get_project_emoji(data.get("logo_props", {}))
     project_name = data.get("name", "Untitled Project")
     project_identifier = data.get("identifier")
     title_suffix = f"{project_name} [{project_identifier}]" if project_identifier else project_name
@@ -215,8 +230,8 @@ def format_issue_comment_message(plane_payload: Dict[str, Any], api_client: Plan
         logger.warning(f"Could not fetch API details for comment on issue {issue_id}. Skipping notification.")
         return None
 
-    project_identifier = project_details.get("identifier", "PROJ")
-    project_emoji = project_details.get("emoji") or "📄"
+    project_identifier = project_details.get("identifier", "UNKWN")
+    project_emoji = get_project_emoji(project_details.get("logo_props", {}))
     issue_seq_id = issue_details.get("sequence_id")
     issue_name = issue_details.get("name", "Untitled Issue")
 
