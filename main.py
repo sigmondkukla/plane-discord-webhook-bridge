@@ -237,6 +237,52 @@ def format_issue_comment_message(plane_payload: Dict[str, Any], api_client: Plan
         }]
     }
 
+def format_module_message(plane_payload: Dict[str, Any], api_client: PlaneAPIClient) -> Optional[Dict[str, Any]]:
+    """Formats a module event into an embed message"""
+    action = plane_payload.get("action", "created")
+    data = plane_payload.get("data", {})
+    actor = plane_payload.get("activity", {}).get("actor", {})
+
+    project_id = data.get("project")
+    if not project_id: return None
+
+    project_details = api_client.get_project_details(project_id)
+    if not project_details:
+        logger.warning(f"Could not fetch API details for project {project_id}. Skipping module notification.")
+        return None
+
+    project_emoji = project_details.get("emoji") or "📦"
+    module_name = data.get("name", "Untitled Module")
+    embed_title = f"{project_emoji} Module {action}: {module_name}"
+    
+    module_id = data.get("id")
+    embed_url = f"{PLANE_WORKSPACE_URL}/projects/{project_id}/modules/{module_id}" if module_id and PLANE_WORKSPACE_URL else None
+
+    if action == "updated":
+        embed_description = format_update_description(plane_payload.get('activity', {}))
+    else:
+        embed_description = f"The module **{module_name}** was {action} in project **{project_details.get('name')}**."
+
+    fields = [
+        {"name": "Status", "value": data.get("status", "N/A").title(), "inline": True}
+    ]
+    # The lead is just an ID in the webhook, so we can't easily resolve the name without another API call.
+    # For now, we show the actor who created it as a proxy for the lead on creation.
+    if data.get("lead"):
+         fields.append({"name": "Lead", "value": get_full_name(actor) if action == "created" else "N/A", "inline": True})
+
+    return {
+        "embeds": [{
+            "author": get_author_info(actor),
+            "title": embed_title,
+            "url": embed_url,
+            "description": embed_description,
+            "color": 3447003,  # Blue
+            "fields": fields,
+            "timestamp": data.get("updated_at") or data.get("created_at")
+        }]
+    }
+
 def format_plaintext(message: str) -> Dict[str, str]:
     """Formats a plaintext message to be sent to Discord"""
     return {"content": message}
@@ -291,6 +337,7 @@ async def plane_webhook_handler(request: Request, x_plane_signature: str = Heade
         "issue": format_issue_message,
         "project": format_project_message,
         "issue_comment": format_issue_comment_message,
+        "module": format_module_message,
     }.get(plane_payload.get("event"), format_unsupported_message)
     
     discord_payload = formatter(plane_payload, plane_api)
